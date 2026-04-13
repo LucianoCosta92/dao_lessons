@@ -5,9 +5,9 @@
     use Core\Database\Connection;
     use Core\Database\Entities\AbstractEntity;
     use Core\Database\EntityManager;
+    use Core\Database\Services\LoggerService;
     use Exception;
-    use Monolog\Handler\StreamHandler;
-    use Monolog\Logger;
+    use Monolog\Level;
     use PDO;
     use PDOException;
 
@@ -20,11 +20,13 @@
         protected string $table;
         protected string $entity;
         protected EntityManager $entityManager;
+        protected LoggerService $logger;
 
         public function __construct()
         {
             $this->connection = Connection::getConnection();
             $this->entityManager = new EntityManager();
+            $this->logger = new LoggerService();
         }
 
         /**
@@ -34,26 +36,46 @@
          * @return T[]|null <- array de entidades do tipo T (ex: UserEntity[])
          */
         public function findAll(array $options = []): ?array {
-            $allowedFields = ['id', 'firstName', 'lastName', 'email'];
+            try{
+                $allowedFields = ['id', 'firstName', 'lastName', 'email'];
             
-            $fields = $options['fields'] ?? $allowedFields;
+                $fields = $options['fields'] ?? $allowedFields;
 
-            if(is_string($fields)){
-                $fields = explode(',', $fields);
+                if(is_string($fields)){
+                    $fields = explode(',', $fields);
+                }
+
+                $fields = array_map('trim', $fields);
+
+                if(!empty(array_diff($fields, $allowedFields))){
+                    throw new Exception("Invalid field(s): " . implode(', ', array_diff($fields, $allowedFields)));
+                }
+
+                $fieldSql = implode(', ', $fields);
+
+                $sql = "SELECT {$fieldSql} FROM {$this->table}";
+                $select = $this->connection->query($sql);
+                $data = $select->fetchAll();
+
+                $this->logAction(
+                    "findAll executado",
+                    Level::Debug,
+                    ['table' => $this->table, 'fields' => $fields]
+                );
+
+                return $this->entityManager->mapToEntity($this->entity, $data);
+            }catch(Exception $e){
+                $this->logAction("Erro no findAll", Level::Error, [
+                    'table' => $this->table,
+                    'error' => $e->getMessage()
+                ]);
+
+                throw $e;
+            } catch(\Exception $e){
+                $this->logAction("Erro inesperado no findAll", Level::Warning, ['table' => $this->table,'error' => $e->getMessage()]);
+                throw $e;
             }
 
-            $fields = array_map('trim', $fields);
-
-            if(!empty(array_diff($fields, $allowedFields))){
-                throw new Exception("Invalid field(s): " . implode(', ', array_diff($fields, $allowedFields)));
-            }
-
-            $fieldSql = implode(', ', $fields);
-
-            $sql = "SELECT {$fieldSql} FROM {$this->table}";
-            $select = $this->connection->query($sql);
-            $data = $select->fetchAll();
-            return $this->entityManager->mapToEntity($this->entity, $data);
         }
 
         /**
@@ -65,41 +87,59 @@
          * @return T|null
          */
         public function findBy(string $field, mixed $value, array $options = []): ?AbstractEntity {
-            $allowedFields = ['id', 'firstName', 'lastName', 'email'];
+            try{
+                $allowedFields = ['id', 'firstName', 'lastName', 'email'];
 
-            if(!in_array($field, $allowedFields)){
-                throw new Exception("Invalid filter field: {$field}");
+                if(!in_array($field, $allowedFields)){
+                    throw new Exception("Invalid filter field: {$field}");
+                }
+                
+                $fields = $options['fields'] ?? $allowedFields;
+
+                if(is_string($fields)){
+                    $fields = explode(',', $fields);
+                }
+
+                $fields = array_map('trim', $fields);
+
+                if(!empty(array_diff($fields, $allowedFields))){
+                    throw new Exception("Invalid field(s): " . implode(', ', array_diff($fields, $allowedFields)));
+                }
+
+                $fieldSql = implode(', ', $fields);
+
+                $sql = "SELECT {$fieldSql} FROM {$this->table} WHERE {$field} = :value";
+                $prepare = $this->connection->prepare($sql);
+                $prepare->execute([
+                    'value' => $value
+                ]);
+
+                $data = $prepare->fetch();
+
+                if(!$data){
+                    $this->logAction(
+                        "Registro não encontrado",
+                        Level::Notice,
+                        ['table' => $this->table, 'field' => $field, 'value' => $value]
+                    );
+                    return null;
+                }
+
+                $this->logAction("findBy executado", Level::Debug, ['table' => $this->table, 'field' => $field]);
+
+                $entity = $this->entityManager->mapToEntity($this->entity, $data);
+                $this->entityManager->snapshotEntityManager->takeSnapshot($entity);
+                return $entity;
+            }catch(Exception $e){
+                $this->logAction("Erro no findBy", Level::Error, [
+                    'table' => $this->table,
+                    'error' => $e->getMessage()
+                ]);
+                throw $e;
+            } catch(\Exception $e){
+                $this->logAction("Erro inesperado no findBy", Level::Warning, ['table' => $this->table,'error' => $e->getMessage()]);
+                throw $e;
             }
-            
-            $fields = $options['fields'] ?? $allowedFields;
-
-            if(is_string($fields)){
-                $fields = explode(',', $fields);
-            }
-
-            $fields = array_map('trim', $fields);
-
-            if(!empty(array_diff($fields, $allowedFields))){
-                throw new Exception("Invalid field(s): " . implode(', ', array_diff($fields, $allowedFields)));
-            }
-
-            $fieldSql = implode(', ', $fields);
-
-            $sql = "SELECT {$fieldSql} FROM {$this->table} WHERE {$field} = :value";
-            $prepare = $this->connection->prepare($sql);
-            $prepare->execute([
-                'value' => $value
-            ]);
-
-            $data = $prepare->fetch();
-
-            if(!$data){
-                return null;
-            }
-
-            $entity = $this->entityManager->mapToEntity($this->entity, $data);
-            $this->entityManager->snapshotEntityManager->takeSnapshot($entity);
-            return $entity;
         }
 
         /**
@@ -128,10 +168,13 @@
                 $prepare->execute($data);
                 $lastInsertedId = $this->connection->lastInsertId();
 
-                $this->logAction("Novo registro inserido em {$this->table}. ID: {$lastInsertedId}", Logger::INFO, $data);
+                $this->logAction("Novo registro inserido em {$this->table}. ID: {$lastInsertedId}", Level::Info, $data);
                 return $this->findById($lastInsertedId);
             }catch (\PDOException $e){
-                $this->logAction("FALHA AO INSERIR em {$this->table}", Logger::ERROR, ['error' => $e->getMessage()]);
+                $this->logAction("ERRO NO BANCO AO INSERIR", Level::Error, ['table' => $this->table, 'error' => $e->getMessage()]);
+                throw $e;
+            } catch(\Exception $e){
+                $this->logAction("Erro inesperado no insert", Level::Warning, ['table' => $this->table, 'error' => $e->getMessage()]);
                 throw $e;
             }
         }
@@ -166,7 +209,7 @@
                 if($rowCount > 0){
                     $this->logAction(
                         "Registro atualizado",
-                        Logger::NOTICE,
+                        Level::Notice,
                         [
                             'tabela' => $this->table,
                             'id' => $entity->id,
@@ -179,7 +222,10 @@
 
                 return $rowCount;
             }catch (\PDOException $e) {
-                $this->logAction("FALHA AO ATUALIZAR em {$this->table} (ID: {$entity->id})", Logger::ERROR, ['error' => $e->getMessage()]);
+                $this->logAction("ERRO NO BANCO AO ATUALIZAR", Level::Error, ['table' => $this->table, 'id' => $entity->id, 'error' => $e->getMessage()]);
+                throw $e;
+            } catch(\Exception $e){
+                $this->logAction("Erro inesperado no update", Level::Warning, ['table' => $this->table,'id' => $entity->id,'error' => $e->getMessage()]);
                 throw $e;
             }
 
@@ -200,28 +246,23 @@
                 $rowCount = $prepare->rowCount();
 
                 if($rowCount > 0){
-                    $this->logAction("Usuário deletado em {$this->table}", Logger::WARNING, ['id_deletado' => $entity->id]);
+                    $this->logAction("Usuário deletado em {$this->table}", Level::Warning, ['id_deletado' => $entity->id]);
+                }else{
+                    $this->logAction("Nenhum registro encontrado para deletar", Level::Warning, ['table' => $this->table, 'id' => $entity->id]);
                 }
 
                 return $rowCount;
             }catch(\PDOException $e){
-                $this->logAction("FALHA AO DELETAR em {$this->table}", Logger::ERROR, ['id' => $entity->id, 'error' => $e->getMessage()]);
-                return null;
+                $this->logAction("ERRO DE BANCO AO DELETAR", Level::Error, [ 'table' => $this->table, 'id' => $entity->id, 'error' => $e->getMessage()]);
+                throw $e;
+            } catch(\Exception $e){
+                $this->logAction("Erro inesperado no delete", Level::Warning, ['table' => $this->table,'id' => $entity->id,'error' => $e->getMessage()]);
+                throw $e;
             }
         }
 
-        private function logAction(string $message, int $level = Logger::WARNING, array $context = []): void{
-            try{
-                $logger = new Logger('web');
-                $logPath = __DIR__ . '/../logs/log.txt';
-
-                $logger->pushHandler(new StreamHandler($logPath, Logger::DEBUG));
-
-                $logger->addRecord($level, $message, $context);
-            }catch(\Exception $e){
-                error_log("Erro Monolog: " . $e->getMessage());
-            }
-
+        protected function logAction(string $message, Level $level = Level::Warning, array $context = []): void{
+            $this->logger->log($message, $level, $context);
         }
 
     }
