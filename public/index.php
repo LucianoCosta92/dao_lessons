@@ -8,6 +8,7 @@
     use App\Database\Entities\UserEntity;
     use Core\Database\Services\LoggerService;
     use Monolog\Level;
+    use Core\Database\Exceptions\HttpException;
 
     require '../vendor/autoload.php';
 
@@ -19,15 +20,28 @@
     });
 
     set_exception_handler(function($exception) use ($logger){
+        $statusCode = 500;
+
+        if($exception instanceof HttpException){
+            $statusCode = $exception->getStatusCode();
+        }
+
         $logger->log(
             $exception->getMessage(),
-            Level::Critical, 
+            Level::Critical,
             [
                 'file' => $exception->getFile(),
                 'line' => $exception->getLine(),
-                'trace' => $exception->getTraceException()
+                'trace' => $exception->getTrace()
             ]
-            );
+        );
+        http_response_code($statusCode);
+        echo match($statusCode){
+            404 => 'Recurso não encontrado',
+            401 => 'Não autorizado',
+            403 => 'Acesso negado',
+            default => 'Erro interno!'
+        };
     });
 
     register_shutdown_function(function() use($logger){
@@ -75,9 +89,9 @@
         ['fields' => 'id, firstName, lastName']
     );*/
 
-    // $user = $userDao->findById(10, ['id', 'firstName', 'email']);
+    $user = $userDao->findById(7, ['id', 'firstName', 'email']);
 
-    // dd($user);
+    dd($user);
 
 
 
